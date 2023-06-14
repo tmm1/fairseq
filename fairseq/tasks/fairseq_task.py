@@ -17,6 +17,7 @@ from fairseq.dataclass.utils import gen_parser_from_dataclass
 from fairseq.optim.amp_optimizer import AMPOptimizer
 from omegaconf import DictConfig
 
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -267,6 +268,14 @@ class FairseqTask(object):
             ~fairseq.iterators.EpochBatchIterator: a batched iterator over the
                 given dataset split
         """
+
+        """
+        Personal Notes:
+        This batch_iterator is initialized in trainer.py
+        The #shard is equal to the world size
+        The shard_id is equal to the local rank
+        """
+
         can_reuse_epoch_itr = (
             not disable_iterator_cache
             and not update_epoch_batch_itr
@@ -282,8 +291,12 @@ class FairseqTask(object):
         dataset.set_epoch(epoch)
 
         # get indices ordered by example size
-        with data_utils.numpy_seed(seed):
-            indices = dataset.ordered_indices()
+        # modified: get indices by order
+        if getattr(self.args, "data_no_shuffle", False):
+            indices = np.arange(len(dataset))
+        else:
+            with data_utils.numpy_seed(seed):
+                indices = dataset.ordered_indices()
 
         # filter examples that are too large
         if max_positions is not None:
@@ -312,6 +325,7 @@ class FairseqTask(object):
             num_workers=num_workers,
             epoch=epoch,
             buffer_size=data_buffer_size,
+            disable_shuffling=getattr(self.args, "data_no_shuffle", False),
             skip_remainder_batch=skip_remainder_batch,
             grouped_shuffling=grouped_shuffling,
             reuse_dataloader=reuse_dataloader,

@@ -93,6 +93,17 @@ class LanguageModelingConfig(FairseqDataclass):
         metadata={"help": "boolean to pad to fixed batch size"},
     )
 
+    # argument for data iteration
+    data_iteration: bool = field(
+        default=False,
+        metadata={"help": "boolean to concat all sub training sets"},
+    )
+
+    data_no_shuffle: bool = field(
+        default=False,
+        metadata={"help": "boolean to disable shuffle"},
+    )
+
     # TODO common vars below add to parent
     seed: int = II("common.seed")
     batch_size: Optional[int] = II("dataset.batch_size")
@@ -206,6 +217,7 @@ class LanguageModelingTask(LegacyFairseqTask):
             split (str): name of the split (e.g., train, valid, valid1, test)
         """
         paths = utils.split_paths(self.args.data)
+        
         assert len(paths) > 0
 
         data_path = paths[(epoch - 1) % len(paths)]
@@ -215,6 +227,7 @@ class LanguageModelingTask(LegacyFairseqTask):
         dataset = data_utils.load_indexed_dataset(
             split_path, self.dictionary, self.args.dataset_impl, combine=combine
         )
+        
         if dataset is None:
             raise FileNotFoundError(f"Dataset not found: {split} ({split_path})")
 
@@ -226,6 +239,7 @@ class LanguageModelingTask(LegacyFairseqTask):
             self.args.tokens_per_sample,
             self.args.seed,
         )
+        
         dataset = TokenBlockDataset(
             dataset,
             dataset.sizes,
@@ -259,7 +273,7 @@ class LanguageModelingTask(LegacyFairseqTask):
             src_vocab=self.dictionary,
             tgt_vocab=self.output_dictionary,
             add_eos_for_other_targets=add_eos_for_other_targets,
-            shuffle=True,
+            shuffle=not self.args.data_no_shuffle,
             targets=self.targets,
             add_bos_token=self.args.add_bos_token,
             fixed_pad_length=fixed_pad_length,

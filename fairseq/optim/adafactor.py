@@ -126,6 +126,7 @@ class Adafactor(torch.optim.Optimizer):
             relative_step=relative_step,
             warmup_init=warmup_init,
         )
+
         super(Adafactor, self).__init__(params, defaults)
 
     @property

@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+import os
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -12,7 +13,7 @@ import torch.nn as nn
 from fairseq import utils
 from fairseq.distributed import fsdp_wrap
 from fairseq.models import FairseqIncrementalDecoder
-from fairseq.models.transformer import TransformerConfig
+from fairseq.models.sidenet import TransformerSideNetConfig
 from fairseq.modules import (
     AdaptiveSoftmax,
     BaseLayer,
@@ -21,12 +22,63 @@ from fairseq.modules import (
     LayerNorm,
     PositionalEmbedding,
     SinusoidalPositionalEmbedding,
-    transformer_layer,
+    sidenet_layer,
+    sidenet_layer_palm,
+    sidenet_layer_palm_sidenet_retrieval,
 )
+from fairseq.modules import transformer_layer
+from fairseq.modules.dynamic_memory_with_chunk import External_Memory
 from fairseq.modules.checkpoint_activations import checkpoint_wrapper
 from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
 from torch import Tensor
 
+from fairseq.checkpoint_utils import load_model_ensemble
+from copy import deepcopy
+
+import time
+
+def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Link to paper: https://arxiv.org/abs/2108.12409 Alibi tensor is not causal as the original paper mentions, it
+    relies on a translation invariance of softmax for quick implementation: with l being a tensor, and a fixed value
+    `softmax(l+a) = softmax(l)`. Based on
+    https://github.com/ofirpress/attention_with_linear_biases/blob/a35aaca144e0eb6b789dfcb46784c4b8e31b7983/fairseq/models/transformer.py#L742
+    TODO @thomasw21 this doesn't work as nicely due to the masking strategy, and so masking varies slightly.
+
+    Args:
+    Returns tensor shaped (batch_size * num_heads, 1, max_seq_len)
+        attention_mask (`torch.Tensor`):
+            Token-wise attention mask, this should be of shape (batch_size, max_seq_len).
+        num_heads (`int`, *required*):
+            number of heads
+        dtype (`torch.dtype`, *optional*, default=`torch.bfloat16`):
+            dtype of the output tensor
+    """
+    batch_size, seq_length = attention_mask.shape
+    closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
+    base = torch.tensor(
+        2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))), device=attention_mask.device, dtype=torch.float32
+    )
+    powers = torch.arange(1, 1 + closest_power_of_2, device=attention_mask.device, dtype=torch.int32)
+    slopes = torch.pow(base, powers)
+
+    if closest_power_of_2 != num_heads:
+        extra_base = torch.tensor(
+            2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))), device=attention_mask.device, dtype=torch.float32
+        )
+        num_remaining_heads = min(closest_power_of_2, num_heads - closest_power_of_2)
+        extra_powers = torch.arange(1, 1 + 2 * num_remaining_heads, 2, device=attention_mask.device, dtype=torch.int32)
+        slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
+
+    # Note: alibi will added to the attention bias that will be applied to the query, key product of attention
+    # => therefore alibi will have to be of shape (batch_size, num_heads, query_length, key_length)
+    # => here we set (batch_size=1, num_heads=num_heads, query_length=1, key_length=max_length)
+    # => the query_length dimension will then be broadcasted correctly
+    # This is more or less identical to T5's relative position bias:
+    # https://github.com/huggingface/transformers/blob/f681437203baa7671de3174b0fa583c349d9d5e1/src/transformers/models/t5/modeling_t5.py#L527
+    arange_tensor = ((attention_mask.cumsum(dim=-1) - 1) * attention_mask)[:, None, :]
+    alibi = slopes[..., None] * arange_tensor
+    return alibi.reshape(batch_size, num_heads, 1, seq_length).to(dtype)
 
 # rewrite name for backward compatibility in `make_generation_fast_`
 def module_name_fordropout(module_name: str) -> str:
@@ -36,7 +88,7 @@ def module_name_fordropout(module_name: str) -> str:
         return module_name
 
 
-class TransformerDecoderBase(FairseqIncrementalDecoder):
+class TransformerDecoderSideNetBase(FairseqIncrementalDecoder):
     """
     Transformer decoder consisting of *cfg.decoder.layers* layers. Each layer
     is a :class:`TransformerDecoderLayer`.
@@ -115,12 +167,19 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             self.layers = LayerDropModuleList(p=self.decoder_layerdrop)
         else:
             self.layers = nn.ModuleList([])
-        self.layers.extend(
-            [
-                self.build_decoder_layer(cfg, no_encoder_attn)
-                for _ in range(cfg.decoder.layers)
-            ]
-        )
+        if cfg.use_external_memory:
+            for i in range(cfg.decoder.layers):
+                if i == int(cfg.retrieval_layer_index/cfg.layer_reduction_factor):
+                    self.layers.extend([self.build_decoder_layer(cfg, no_encoder_attn, memory=True)])
+                else:
+                    self.layers.extend([self.build_decoder_layer(cfg, no_encoder_attn)])
+        else:
+            self.layers.extend(
+                [
+                    self.build_decoder_layer(cfg, no_encoder_attn)
+                    for _ in range(cfg.decoder.layers)
+                ]
+            )
         self.num_layers = len(self.layers)
 
         if cfg.decoder.normalize_before and not cfg.no_decoder_final_norm:
@@ -134,10 +193,55 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             else None
         )
 
+        # self-defined parametes
+        print("Load Pre-trained GPT from {}".format(cfg.pretrained_model_path))
+        self.pretrained_model_path = cfg.pretrained_model_path 
+        self.pretrained_model, _ = load_model_ensemble([self.pretrained_model_path], task=None,
+        arg_overrides={"gpt2_vocab_bpe": os.path.join(cfg.gpt_encoder_path, "vocab.bpe"), "gpt2_encoder_json": os.path.join(cfg.gpt_encoder_path, "encoder.json"), "gpt_dict_path": os.path.join(cfg.gpt_encoder_path, "dict.txt"), "retrieval_layer_index": cfg.retrieval_layer_index})
+        self.pretrained_model = self.pretrained_model[0]
+
+        self.layer_reduction_factor = cfg.layer_reduction_factor
+        
+        if getattr(cfg, "reload_ptm_layer", False):
+            print("Reload from pretrained model layer")
+            
+            param_correspondence = {"self_attn.q_proj.weight": "attn.q_proj.weight", "self_attn.k_proj.weight": "attn.k_proj.weight", "self_attn.v_proj.weight": "attn.v_proj.weight", "self_attn.out_proj.weight": "attn.out_proj.weight", "ln_1.weight": "ln_1.weight", "ln_1.bias": "ln_1.bias", "fc1.weight": "mlp.fc_in.weight", "fc1.bias": "mlp.fc_in.bias", "fc2.weight": "mlp.fc_out.weight", "fc2.bias": "mlp.fc_out.bias", }
+            
+            for i in range(cfg.decoder.layers):
+                for name, param in self.layers[i].state_dict().items():
+                    if name == "self_attn.memory_bias":
+                        continue
+                    if param_correspondence[name] in self.pretrained_model.decoder.model.transformer.h[self.layer_reduction_factor * i + 1].state_dict().keys():
+                        # print(param_correspondence[name])
+                        self.layers[i].state_dict()[name].copy_(self.pretrained_model.decoder.model.transformer.h[self.layer_reduction_factor * i + 1].state_dict()[param_correspondence[name]])
+                    if i < cfg.decoder.layers  // 2:
+                        self.layers[i].requires_grad = False
+            self.layer_norm.state_dict()["weight"].copy_(self.pretrained_model.decoder.model.transformer.ln_f.state_dict()["weight"])
+            self.layer_norm.state_dict()["bias"].copy_(self.pretrained_model.decoder.model.transformer.ln_f.state_dict()["bias"])
+
+        for name, param in self.pretrained_model.named_parameters():
+            param.requires_grad = False
+        # load the pre-trained embedding layer for sidenet
+        self.embed_tokens.weight = self.pretrained_model.decoder.model.transformer.wte.weight
+        self.embed_tokens.weight.requires_grad = False
+
         self.adaptive_softmax = None
         self.output_projection = output_projection
         if self.output_projection is None:
-            self.build_output_projection(cfg, dictionary, embed_tokens)
+            self.build_output_projection(cfg, dictionary, self.embed_tokens)
+
+        self.output_projection.weight = self.pretrained_model.decoder.model.lm_head.weight
+        self.output_projection.weight.requires_grad == False
+        # self.output_projection = self.pretrained_model.decoder.model.lm_head
+        # self.output_projection.weight.requires_grad = False
+        # self.output_projection.bias.requires_grad = False
+        if getattr(cfg, "tune_lm_head", False):
+            self.output_projection.weight.requires_grad = True
+
+        # add parameters for nn retrieval
+        print("set up external memory")
+        self.external_memory = External_Memory(cfg) if cfg.use_external_memory else None
+        self.retrieval_layer_index = cfg.retrieval_layer_index
 
     def build_output_projection(self, cfg, dictionary, embed_tokens):
         if cfg.adaptive_softmax_cutoff is not None:
@@ -171,8 +275,10 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
                 BaseLayer(cfg),
             )
 
-    def build_decoder_layer(self, cfg, no_encoder_attn=False):
-        layer = transformer_layer.TransformerDecoderLayerBase(cfg, no_encoder_attn)
+    def build_decoder_layer(self, cfg, no_encoder_attn=False, memory=False):
+        # build the layers for side network
+        # layer = sidenet_layer.TransformerDecoderSideNetLayer(cfg, no_encoder_attn, memory=memory)
+        layer = sidenet_layer_palm_sidenet_retrieval.TransformerDecoderSideNetLayer(cfg, no_encoder_attn, memory=memory)
         checkpoint = cfg.checkpoint_activations
         if checkpoint:
             offload_to_cpu = cfg.offload_activations
@@ -194,7 +300,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         alignment_heads: Optional[int] = None,
         src_lengths: Optional[Any] = None,
         return_all_hiddens: bool = False,
-        return_qkv_val: Optional[int] = None,
+        disable_add_index: bool = False,
     ):
         """
         Args:
@@ -222,11 +328,12 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             full_context_alignment=full_context_alignment,
             alignment_layer=alignment_layer,
             alignment_heads=alignment_heads,
-            return_qkv_val=return_qkv_val,
+            disable_add_index=disable_add_index,
         )
 
         if not features_only:
-            x = self.output_layer(x)
+            # x = self.output_layer(x)
+            x = self.pretrained_model.decoder.model.lm_head(x)
         return x, extra
 
     def extract_features(
@@ -237,7 +344,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         full_context_alignment: bool = False,
         alignment_layer: Optional[int] = None,
         alignment_heads: Optional[int] = None,
-        return_qkv_val: Optional[int] = None,
+        disable_add_index: bool = False,
     ):
         return self.extract_features_scriptable(
             prev_output_tokens,
@@ -246,7 +353,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             full_context_alignment,
             alignment_layer,
             alignment_heads,
-            return_qkv_val=return_qkv_val,
+            disable_add_index=disable_add_index,
         )
 
     """
@@ -263,7 +370,9 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         full_context_alignment: bool = False,
         alignment_layer: Optional[int] = None,
         alignment_heads: Optional[int] = None,
-        return_qkv_val: Optional[int] = None,
+        long_context_retrieval: Optional[Tensor] = None,
+        residual: Optional[Tensor] = None,
+        disable_add_index: bool = False,
     ):
         """
         Similar to *forward* but only return features.
@@ -295,31 +404,30 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         if encoder_out is not None and len(encoder_out["encoder_padding_mask"]) > 0:
             padding_mask = encoder_out["encoder_padding_mask"][0]
 
-        # embed positions
-        positions = None
-        if self.embed_positions is not None:
-            positions = self.embed_positions(
-                prev_output_tokens, incremental_state=incremental_state
-            )
-
-        if incremental_state is not None:
-            prev_output_tokens = prev_output_tokens[:, -1:]
-            if positions is not None:
-                positions = positions[:, -1:]
-
         # Prevent torchscript exporting issue for dynamic quant embedding
         prev_output_tokens = prev_output_tokens.contiguous()
-        # embed tokens and positions
-        x = self.embed_scale * self.embed_tokens(prev_output_tokens)
+        # SideNet directly takes the input embedding from pre-trained GPT2
+        with torch.no_grad():
+            self.pretrained_model.eval()
+            lm_logits, backbone_hidden_states, previous_qkv, position_encoding = self.pretrained_model(prev_output_tokens, return_all_hiddens=True)
+            
+            position_encoding = position_encoding[0]
+            x = backbone_hidden_states[0].detach().transpose(0, 1)
 
+            # if self.external_memory is not None:
+            #     if self.external_memory.dstore_idx == 0:
+            #         long_context_retrieval = None
+            #         knn_index = None
+            #     else:
+            #         retrieval_output = self.external_memory.retrieve(previous_qkv["q"].transpose(0, 1))
+            #         long_context_retrieval = retrieval_output['tgt_index'] if retrieval_output else None
+            #         knn_index = retrieval_output['knn_index'] if retrieval_output else None
+        """
         if self.quant_noise is not None:
             x = self.quant_noise(x)
 
         if self.project_in_dim is not None:
             x = self.project_in_dim(x)
-
-        if positions is not None:
-            x += positions
 
         if self.layernorm_embedding is not None:
             x = self.layernorm_embedding(x)
@@ -329,6 +437,9 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
 
+        Excuted in Backbone Network
+        """
+
         self_attn_padding_mask: Optional[Tensor] = None
         if self.cross_self_attention or prev_output_tokens.eq(self.padding_idx).any():
             self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
@@ -336,28 +447,53 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         # decoder layers
         attn: Optional[Tensor] = None
         inner_states: List[Optional[Tensor]] = [x]
-        qkv_val_for_retrieval = None
         for idx, layer in enumerate(self.layers):
             if incremental_state is None and not full_context_alignment:
                 self_attn_mask = self.buffered_future_mask(x)
             else:
                 self_attn_mask = None
 
-            x, layer_attn, qkv_val = layer(
-                x,
-                enc,
-                padding_mask,
-                incremental_state,
-                self_attn_mask=self_attn_mask,
-                self_attn_padding_mask=self_attn_padding_mask,
-                need_attn=bool((idx == alignment_layer)),
-                need_head_weights=bool((idx == alignment_layer)),
-            )
+            # Compute the residual connction
+            # backbone_hidden_states: (L+1) * E, the first one is embedding output
+            residual = backbone_hidden_states[self.layer_reduction_factor * idx + self.layer_reduction_factor] - backbone_hidden_states[self.layer_reduction_factor * idx]
+            residual = residual.transpose(0, 1) # B x T x C -> T x B x C
+
+            if self.external_memory is not None and idx == int(self.retrieval_layer_index / self.layer_reduction_factor):
+                # B, Nt, num_k, E = long_context_retrieval[idx].shape
+                # long_context = long_context_retrieval[idx].to(x.device)
+                # long_context = long_context_retrieval.to(x.device)
+                x, layer_attn, knn_index = layer(
+                    x,
+                    enc,
+                    padding_mask,
+                    incremental_state,
+                    self_attn_mask=self_attn_mask,
+                    self_attn_padding_mask=self_attn_padding_mask,
+                    need_attn=bool((idx == alignment_layer)),
+                    need_head_weights=bool((idx == alignment_layer)),
+                    position_encoding=position_encoding,
+                    # long_context_retrieval=long_context_retrieval,
+                    residual=residual,
+                    external_memory=self.external_memory,
+                )
+                if not disable_add_index:
+                    self.external_memory.add_index(previous_qkv)#, prev_output_tokens != self.padding_idx)
+            else:
+                x, layer_attn, _ = layer(
+                    x,
+                    enc,
+                    padding_mask,
+                    incremental_state,
+                    self_attn_mask=self_attn_mask,
+                    self_attn_padding_mask=self_attn_padding_mask,
+                    need_attn=bool((idx == alignment_layer)),
+                    need_head_weights=bool((idx == alignment_layer)),
+                    residual=residual,
+                    position_encoding=position_encoding,
+                )
             inner_states.append(x)
             if layer_attn is not None and idx == alignment_layer:
                 attn = layer_attn.float().to(x)
-            if return_qkv_val is not None and idx == return_qkv_val:
-                qkv_val_for_retrieval = qkv_val
 
         if attn is not None:
             if alignment_heads is not None:
@@ -375,7 +511,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         if self.project_out_dim is not None:
             x = self.project_out_dim(x)
 
-        return x, {"attn": [attn], "inner_states": inner_states, "qkv_val": qkv_val_for_retrieval}
+        return x, {"attn": [attn], "inner_states": inner_states, "knn_index": knn_index}
 
     def output_layer(self, features):
         """Project features to the vocabulary size."""
@@ -461,7 +597,7 @@ def Linear(in_features, out_features, bias=True):
     return m
 
 
-class TransformerDecoder(TransformerDecoderBase):
+class TransformerDecoderSideNet(TransformerDecoderSideNetBase):
     def __init__(
         self,
         args,
@@ -472,7 +608,7 @@ class TransformerDecoder(TransformerDecoderBase):
     ):
         self.args = args
         super().__init__(
-            TransformerConfig.from_namespace(args),
+            TransformerSideNetConfig.from_namespace(args),
             dictionary,
             embed_tokens,
             no_encoder_attn=no_encoder_attn,
@@ -481,10 +617,10 @@ class TransformerDecoder(TransformerDecoderBase):
 
     def build_output_projection(self, args, dictionary, embed_tokens):
         super().build_output_projection(
-            TransformerConfig.from_namespace(args), dictionary, embed_tokens
+            TransformerSideNetConfig.from_namespace(args), dictionary, embed_tokens
         )
 
-    def build_decoder_layer(self, args, no_encoder_attn=False):
+    def build_decoder_layer(self, args, no_encoder_attn=False, memory=False):
         return super().build_decoder_layer(
-            TransformerConfig.from_namespace(args), no_encoder_attn=no_encoder_attn
+            TransformerSideNetConfig.from_namespace(args), no_encoder_attn=no_encoder_attn, memory=memory
         )

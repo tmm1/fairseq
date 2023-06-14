@@ -481,6 +481,10 @@ class EpochBatchIterator(EpochBatchIterating):
             self.batch_sampler.make_batches_for_epoch(epoch, offset)
             itr = self.dataloader
         else:
+            """
+            Personal Notes:
+            The frozenbatchsampler calls the method of ordered_batches to construct the batches for each gpu
+            """
             self.batch_sampler = FrozenBatchSampler(
                 self.ordered_batches,
                 epoch,
@@ -528,7 +532,6 @@ class EpochBatchIterator(EpochBatchIterating):
     def ordered_batches(self, epoch, fix_batches_to_gpus, shuffle):
         def shuffle_batches(batches, seed):
             with data_utils.numpy_seed(seed):
-
                 if self.grouped_shuffling:
                     grouped_batches = [
                         batches[(i * self.num_shards) : ((i + 1) * self.num_shards)]
@@ -557,12 +560,44 @@ class EpochBatchIterator(EpochBatchIterating):
         else:
             if shuffle:
                 batches = shuffle_batches(list(self.frozen_batches), self.seed + epoch)
+                batches = list(
+                        ShardedIterator(batches, self.num_shards, self.shard_id, fill_value=[])
+                    )
             else:
+                # My version for sharding
                 batches = self.frozen_batches
-            batches = list(
-                ShardedIterator(batches, self.num_shards, self.shard_id, fill_value=[])
-            )
-        return batches
+                total_samples = batches[-1][-1]
+                sample_list = list(range(total_samples))
+                bsz = len(batches[0])
+                num_passages = self.num_shards * bsz
+                passage_len = int(math.ceil(total_samples / num_passages))
+                passages_list = [
+                        sample_list[(i * passage_len) : (i + 1) * passage_len]
+                        for i in range(num_passages)
+                    ]
+                current_shard_passages = passages_list[self.shard_id * bsz : (self.shard_id + 1)*bsz]
+                len_per_pasage = [len(p) for p in current_shard_passages]
+                num_batches_current_shard = min((len_per_pasage))
+                new_batches = []
+                for i in range(num_batches_current_shard):
+                    l = []
+                    for passage in current_shard_passages:
+                        l.append(passage[i])
+                    new_batches.append(l)
+                print(new_batches[0])
+                print(new_batches[1])
+                """
+                Personal Notes:
+                In the next line, the Fairseq dataset is splited into different shard accoriding to different shard id of gpus
+                fairseq.MonolingualDataset does not support fetch
+
+                Batches is a list with its element as numpy.ndarray
+                """
+                # batches = self.frozen_batches
+                # batches = list(
+                #     ShardedIterator(batches, self.num_shards, self.shard_id, fill_value=[])
+                # )
+        return new_batches
 
 
 class GroupedIterator(CountingIterator):

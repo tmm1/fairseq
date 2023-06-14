@@ -201,6 +201,10 @@ def main(cfg: FairseqConfig) -> None:
             # don't cache epoch iterators for sharded datasets
             disable_iterator_cache=task.has_sharded_data("train"),
         )
+        
+        if getattr(cfg.model, "use_external_memory", False):
+            logger.info("Reset the retrieval index for epoch {}".format(epoch_itr.next_epoch_idx))
+            model.decoder.external_memory.reset()
     train_meter.stop()
     logger.info("done training in {:.1f} seconds".format(train_meter.sum))
 

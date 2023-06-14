@@ -94,7 +94,7 @@ class QuantNoiseConfig(FairseqDataclass):
 
 
 @dataclass
-class TransformerConfig(FairseqDataclass):
+class TransformerSideNetConfig(FairseqDataclass):
     activation_fn: ChoiceEnum(utils.get_available_activation_fns()) = field(
         default="relu",
         metadata={"help": "activation function to use"},
@@ -229,43 +229,85 @@ class TransformerConfig(FairseqDataclass):
         metadata={"help": "don't add an extra layernorm after the last decoder block"},
     )
 
-    # add args for knn retrieval
-    use_knn_datastore: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Deploy knn retrival in the inference stage"},
+    # argument for sidenetwork
+    pretrained_model_path: Optional[str] = field(
+        default="/path/to/checkpoint",
+        metadata={"help": "Path to the pre-trained backbone transformer"},
     )
-    load_knn_datastore: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Load the keys in the cached datastore"},
+
+    reduction_factor: Optional[int] = field(
+        default=8,
+        metadata={
+            "help": "the reduction factor for constructing side network from backbone transformer",
+        },
     )
-    dstore_fp16: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Save the cached keys in the datatype of fp16"},
+    gpt_encoder_path: Optional[str] = field(
+        default="/mnt/multimodal/data/text/openwebtext2",
+        metadata={"help": "Path to the pre-trained backbone model encoder and vovab"},
     )
+
+    reload_ptm_layer: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Whether re-init the layers of GPT2 for side network",
+        },
+    )
+
+    tune_lm_head: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Whether reload the LM Head of GPT2 for side network",
+        }
+    )
+
+    layer_reduction_factor: Optional[int] = field(
+        default=2,
+        metadata={
+            "help": "the layer reduction factor for constructing side network from backbone transformer",
+        },
+    )
+
+    # retrieval arguments
+    use_external_memory: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Deploy External Memory for Long Sequence Memory"},
+    )
+
+    retrieval_layer_index: Optional[int] = field(
+        default=10,
+        metadata={"help": "The output hidden states at this layer would be used as keys for dense retrieval"},
+    )
+
+    chunk_size: Optional[int] = field(
+        default=8,
+        metadata={"help": "The output hidden states at this layer would be used as keys for dense retrieval"},
+    )
+
     use_gpu_to_search: Optional[bool] = field(
         default=False,
         metadata={"help": "Use GPU to conduct nearet neighbor search"},
     )
-    move_dstore_to_mem: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Move cached datastore clusters to memory"},
-    )
-    dstore_size: Optional[int] = field(
-        default=10000000,
-        metadata={"help": "The size of cached datastore"},
-    )
+
     k: Optional[int] = field(
         default=8,
         metadata={"help": "The number of nearest neighbor in the retrieval stage"},
     )
+
     probe: Optional[int] = field(
         default=32,
         metadata={"help": "The number of visited clusters during nearest neighbor searching"},
     )
-    dstore_filename: Optional[str] = field(
-        default="data/datastore",
-        metadata={"help": "The path to cached datastore"},
+    
+    long_context_attention: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Replace self-attention with joint-attention in specific layer"},
     )
+
+    memory_size: Optional[int] = field(
+        default=1048576,
+        metadata={"help": "Memorizing #keys in external index"},
+    )
+
     # We need to make this hierarchical dataclass like the flat namespace
     # __getattr__ and __setattr__ here allow backward compatibility
     # for subclasses of Transformer(Legacy) that depend on read/write on

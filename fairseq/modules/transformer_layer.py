@@ -547,6 +547,10 @@ class TransformerDecoderLayerBase(nn.Module):
         self_attn_padding_mask: Optional[torch.Tensor] = None,
         need_attn: bool = False,
         need_head_weights: bool = False,
+        key_val=None,
+        value_val=None,
+        demons_num=-1,
+        scalar=-1,
     ):
         """
         Args:
@@ -602,7 +606,7 @@ class TransformerDecoderLayerBase(nn.Module):
         else:
             y = x
 
-        x, attn = self.self_attn(
+        x, attn, qkv_val = self.self_attn(
             query=x,
             key=y,
             value=y,
@@ -680,7 +684,7 @@ class TransformerDecoderLayerBase(nn.Module):
             else:
                 self_attn_state = [saved_state["prev_key"], saved_state["prev_value"]]
             return x, attn, self_attn_state
-        return x, attn, None
+        return x, attn, qkv_val
 
     def make_generation_fast_(self, need_attn: bool = False, **kwargs):
         self.need_attn = need_attn

@@ -84,6 +84,10 @@ def DistributedFairseqModel(args, model, process_group, device):
         # forward missing getattr and state_dict/load_state_dict to orig model
         wrapped_model = ModuleProxyWrapper(wrapped_model)
     elif args.ddp_backend in {"no_c10d", "legacy_ddp"}:
+        """
+        Personal Notes:
+        Maybe we could modify distributedfairseqmodel wrapper to deal with index sync
+        """
         wrapped_model = LegacyDistributedDataParallel(
             module=model.to(device),
             buffer_size=2**28,
